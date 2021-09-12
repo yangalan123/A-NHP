@@ -114,14 +114,6 @@ class XFMRNHPFast(nn.Module):
         tem_enc = self.compute_temporal_embedding(time_seqs)
         tem_enc *= batch_non_pad_mask.unsqueeze(-1)
         enc_input = torch.tanh(self.Emb(event_seqs))
-        # if self.add_bos:
-        #     _event_seqs = event_seqs.clone()
-        #     _event_seqs[:, 0] = self.pad_idx
-        #     # bos embedding -- all zero
-        #     enc_input = torch.tanh(self.Emb(_event_seqs))
-        # else:
-        #     enc_input = torch.tanh(self.Emb(event_seqs))
-        # layer_ = torch.cat([torch.zeros_like(enc_input), tem_enc], dim=-1)
         init_cur_layer_ = torch.zeros_like(enc_input)
         layer_mask = (torch.eye(attention_mask.size(1)) < 1).unsqueeze(0).expand_as(attention_mask).to(
             attention_mask.device)
@@ -134,37 +126,8 @@ class XFMRNHPFast(nn.Module):
         _combined_mask = torch.cat([attention_mask, layer_mask], dim=-1)
         # batch_size * (2 * seq_len) * (2 * seq_len)
         contextual_mask = torch.cat([attention_mask, torch.ones_like(layer_mask)], dim=-1)
-        # contextual_mask = torch.ones_like(_combined_mask)
         _combined_mask = torch.cat([contextual_mask, _combined_mask], dim=1)
         enc_input = torch.cat([enc_input, tem_enc], dim=-1)
-        # _combined_non_pad_mask = torch.cat([batch_non_pad_mask, batch_non_pad_mask], dim=1)
-
-        # cur_layers = []
-        # for head_i in range(self.n_head):
-        #     cur_layer_ = init_cur_layer_
-        #     for layer_i in range(self.n_layers):
-        #         layer_ = torch.cat([cur_layer_, tem_enc_layer], dim=-1)
-        #         _combined_input = torch.cat([enc_input, layer_], dim=1)
-        #         if self.sharing_param_layer:
-        #             enc_layer = self.heads[head_i][0]
-        #         else:
-        #             enc_layer = self.heads[head_i][layer_i]
-        #         enc_output = enc_layer(
-        #             _combined_input,
-        #             _combined_mask
-        #         )
-        #         _cur_layer_ = enc_output[:, enc_input.size(1):, :] * (batch_non_pad_mask.unsqueeze(-1))
-        #         # add residual connection
-        #         cur_layer_ = torch.tanh(_cur_layer_) + cur_layer_
-        #         # non-residual connection
-        #         # cur_layer_ = torch.tanh(_cur_layer_)
-        #
-        #         # enc_output *= _combined_non_pad_mask.unsqueeze(-1)
-        #         # layer_ = torch.tanh(enc_output[:, enc_input.size(1):, :])
-        #         if self.use_norm:
-        #             cur_layer_ = self.norm(cur_layer_)
-        #     cur_layers.append(cur_layer_)
-        # cur_layer_ = torch.cat(cur_layers, dim=-1)
         cur_layer_ = self.forward_pass(init_cur_layer_, tem_enc, tem_enc_layer, enc_input, _combined_mask, batch_non_pad_mask)
 
         return cur_layer_
@@ -172,24 +135,16 @@ class XFMRNHPFast(nn.Module):
     def compute_loglik(self, batch):
         time_seq, time_delta_seq, event_seq, batch_non_pad_mask, attention_mask, type_mask = batch
         # 1. compute event-loglik
-        # enc_out = self.forward(event_seq, time_seq, batch_non_pad_mask, attention_mask)
         enc_out = self.forward(event_seq[:, :-1], time_seq[:, :-1], batch_non_pad_mask[:, 1:], attention_mask[:, 1:, :-1], time_seq[:, 1:])
         enc_inten = self.softplus(self.inten_linear(enc_out))
         # original: 1->1, 2->2
         # event_lambdas = torch.sum(enc_inten * type_mask, dim=2) + self.eps
         # now: 1->2, 2->3
         event_lambdas = torch.sum(enc_inten * type_mask[:, 1:], dim=2) + self.eps
-        # incase event_lambdas == 0
+        # in case event_lambdas == 0
         # event_lambdas.masked_fill_(~batch_non_pad_mask, 1.0)
         event_lambdas.masked_fill_(~batch_non_pad_mask[:, 1:], 1.0)
 
-        # if self.add_bos:
-        #     # do not compute time intensities earlier than [bos]
-        #     event_ll = torch.log(event_lambdas[:, 1:])
-        #     res_enc_inten = enc_inten[:, 1:]
-        # else:
-        #     event_ll = torch.log(event_lambdas)
-        #     res_enc_inten = enc_inten
         event_ll = torch.log(event_lambdas)
         res_enc_inten = enc_inten
 
@@ -200,8 +155,6 @@ class XFMRNHPFast(nn.Module):
         # due to GPU memory limitation, we may not be able to compute all intensities at all sampled times,
         # step gives the batch size w.r.t how many sampled times we should process at each batch
         step = 20
-        # [TODO]: keep in mind the current implementation is not the right way for concurrent events
-        # add [bos]@t=0
         if not self.add_bos:
             extended_time_seq = torch.cat([torch.zeros(time_seq.size(0), 1).to(time_seq.device), time_seq], dim=-1)
             diff_time = (time_seq[:, :] - extended_time_seq[:, :-1]) * batch_non_pad_mask[:, :]
@@ -211,7 +164,6 @@ class XFMRNHPFast(nn.Module):
             all_lambda = self._compute_intensities_fast(event_seq, time_seq, batch_non_pad_mask, attention_mask,
                                                         temp_time, step)
         else:
-            # debug 4/13
             # why non_pad_mask start from 1?
             # think about a simple case: [e] [e] [pad] (non_pad_mask: 1 1 0)
             # you want to compute the first interval only, so if you use non_pad_mask[:, :-1] (1, 1),
@@ -241,27 +193,17 @@ class XFMRNHPFast(nn.Module):
         # assume we will sample the same number of times in each interval of the event_seqs
         all_lambda = []
         batch_size = event_seq.size(0)
-        # seq_len = event_seq.size(1) - 1
         seq_len = event_seq.size(1)
         num_samples = temp_time.size(0)
         for i in range(0, num_samples, step):
             _extra_time = temp_time[i: i + step, :, :]
             _step = _extra_time.size(0)
-            # _buf_time = []
-            # for j in range(_step):
-            #     _buf_time.append(_extra_time[:, :, j])
             _extra_time = _extra_time.reshape(_step * batch_size, -1)
-            # _extra_time = _extra_time.transpose(2, 1).reshape(-1, temp_time.size(1))
             _types = event_seq.expand(_step, -1, -1).reshape(_step * batch_size, -1)
             _times = time_seq.expand(_step, -1, -1).reshape(_step * batch_size, -1)
-            # _batch_non_pad_mask = batch_non_pad_mask[:, :-1].unsqueeze(0).expand(_step, -1, -1).reshape(_step * batch_size, -1)
             _batch_non_pad_mask = batch_non_pad_mask.unsqueeze(0).expand(_step, -1, -1).reshape(_step * batch_size, -1)
-            # _attn_mask = attention_mask[:, :-1, :-1].unsqueeze(0).expand(_step, -1, -1, -1).reshape(_step * batch_size, seq_len, seq_len)
             _attn_mask = attention_mask.unsqueeze(0).expand(_step, -1, -1, -1).reshape(_step * batch_size, seq_len,
                                                                                        seq_len)
-            # _times = torch.cat([time] * _extra_time.size(2), dim=0)
-
-            # _enc_output = self.forward(_types[:, :-1], _times[:, :-1],
             _enc_output = self.forward(_types, _times,
                                        _batch_non_pad_mask,
                                        _attn_mask,
@@ -303,26 +245,6 @@ class XFMRNHPFast(nn.Module):
         # t_i < sampled_t
         attention_mask[:, seq_len:, seq_len - 1][time_seq[:, -1:] < sampled_times] = 0
         attention_mask[:, seq_len:, seq_len:] = (torch.eye(num_samples) < 1).unsqueeze(0).to(event_seq.device)
-        # cur_layers = []
-        # for head_i in range(self.n_head):
-        #     cur_layer_ = init_cur_layer_
-        #     for layer_i in range(self.n_layers):
-        #         layer_ = torch.cat([cur_layer_, tem_layer_], dim=-1)
-        #         _combined_input = torch.cat([enc_input, layer_], dim=1)
-        #         if self.sharing_param_layer:
-        #             enc_layer = self.heads[head_i][0]
-        #         else:
-        #             enc_layer = self.heads[head_i][layer_i]
-        #         enc_output = enc_layer(
-        #             _combined_input,
-        #             attention_mask
-        #         )
-        #         _cur_layer = enc_output[:, enc_input.size(1):, :]
-        #         cur_layer_ = torch.tanh(_cur_layer) + cur_layer_
-        #         if self.use_norm:
-        #             cur_layer_ = self.norm(cur_layer_)
-        #     cur_layers.append(cur_layer_)
-        # cur_layer_ = torch.cat(cur_layers, dim=-1)
         cur_layer_ = self.forward_pass(init_cur_layer_, tem_enc, tem_layer_, enc_input, attention_mask)
 
         sampled_intensities = self.softplus(self.inten_linear(cur_layer_))
